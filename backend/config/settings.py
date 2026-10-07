@@ -36,6 +36,7 @@ ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     'accounts.apps.AccountsConfig',
+    'tickets.apps.TicketsConfig',
     'rest_framework',
     'django.contrib.admin',
     'django.contrib.auth',

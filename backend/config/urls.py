@@ -23,4 +23,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/auth/', include('accounts.urls')),
     path('api/departments/', DepartmentListCreateView.as_view(), name='department-list'),
+    path('api/tickets/', include('tickets.urls')),
 ]
