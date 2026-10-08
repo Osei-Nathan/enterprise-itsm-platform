@@ -4,6 +4,7 @@ from rest_framework import serializers
 from accounts.models import UserRole
 
 from .models import Ticket
+from .sla import create_ticket, update_ticket
 
 User = get_user_model()
 
@@ -20,6 +21,7 @@ class TicketSerializer(serializers.ModelSerializer):
 			'description',
 			'category',
 			'priority',
+			'sla_policy',
 			'status',
 			'requester',
 			'assignee',
@@ -32,12 +34,18 @@ class TicketSerializer(serializers.ModelSerializer):
 			'resolved_at',
 			'closed_at',
 			'reopened_at',
+			'first_response_due_at',
+			'resolution_due_at',
+			'first_responded_at',
+			'response_breached',
+			'resolution_breached',
 			'created_at',
 			'updated_at',
 		)
 		read_only_fields = (
 			'id',
 			'ticket_number',
+			'sla_policy',
 			'status',
 			'assignee',
 			'department',
@@ -49,14 +57,20 @@ class TicketSerializer(serializers.ModelSerializer):
 			'resolved_at',
 			'closed_at',
 			'reopened_at',
+			'first_response_due_at',
+			'resolution_due_at',
+			'first_responded_at',
+			'response_breached',
+			'resolution_breached',
 			'created_at',
 			'updated_at',
 		)
 
 	def create(self, validated_data):
-		requester = validated_data['requester']
-		validated_data['department'] = requester.department
-		return super().create(validated_data)
+		return create_ticket(validated_data)
+
+	def update(self, instance, validated_data):
+		return update_ticket(instance, validated_data)
 
 
 class AssignTicketSerializer(serializers.Serializer):

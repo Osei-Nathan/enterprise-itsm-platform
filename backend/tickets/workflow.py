@@ -10,6 +10,7 @@ from .serializers import (
 	PendingTicketSerializer,
 	ResolveTicketSerializer,
 )
+from .sla import evaluate_sla_breaches, record_first_response
 
 
 def can_manage_ticket(user, ticket):
@@ -139,4 +140,8 @@ def perform_ticket_action(action, ticket, actor, data):
 	ticket.status = new_status
 	ticket.save()
 	_record_event(ticket, actor, event_type, previous_status, details=details)
+	if action == 'start' and not ticket.first_responded_at:
+		record_first_response(ticket, actor, responded_at=now)
+	elif action == 'resolve':
+		evaluate_sla_breaches(ticket, at=now, actor=actor)
 	return ticket

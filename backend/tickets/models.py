@@ -36,13 +36,33 @@ class TicketStatus(models.TextChoices):
 
 
 class TicketEventType(models.TextChoices):
+	TICKET_CREATED = 'TICKET_CREATED', 'Ticket Created'
 	ASSIGNED = 'ASSIGNED', 'Assigned'
 	STARTED = 'STARTED', 'Started'
 	PENDED = 'PENDED', 'Set Pending'
 	RESUMED = 'RESUMED', 'Resumed'
+	FIRST_RESPONSE = 'FIRST_RESPONSE', 'First Response'
+	SLA_WARNING = 'SLA_WARNING', 'SLA Warning'
+	SLA_BREACHED = 'SLA_BREACHED', 'SLA Breached'
 	RESOLVED = 'RESOLVED', 'Resolved'
 	CLOSED = 'CLOSED', 'Closed'
 	REOPENED = 'REOPENED', 'Reopened'
+
+
+class SlaPolicy(models.Model):
+	priority = models.CharField(
+		max_length=20,
+		choices=TicketPriority.choices,
+		unique=True,
+	)
+	response_target = models.DurationField()
+	resolution_target = models.DurationField()
+	is_active = models.BooleanField(default=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	def __str__(self):
+		return f'{self.get_priority_display()} SLA'
 
 
 class Ticket(models.Model):
@@ -65,6 +85,13 @@ class Ticket(models.Model):
 		max_length=20,
 		choices=TicketPriority.choices,
 		default=TicketPriority.MEDIUM,
+	)
+	sla_policy = models.ForeignKey(
+		SlaPolicy,
+		on_delete=models.PROTECT,
+		related_name='tickets',
+		null=True,
+		blank=True,
 	)
 	status = models.CharField(
 		max_length=20,
@@ -90,6 +117,11 @@ class Ticket(models.Model):
 		null=True,
 		blank=True,
 	)
+	first_response_due_at = models.DateTimeField(null=True, blank=True)
+	resolution_due_at = models.DateTimeField(null=True, blank=True)
+	first_responded_at = models.DateTimeField(null=True, blank=True)
+	response_breached = models.BooleanField(default=False)
+	resolution_breached = models.BooleanField(default=False)
 	pending_reason = models.TextField(blank=True)
 	resolution_summary = models.TextField(blank=True)
 	assigned_at = models.DateTimeField(null=True, blank=True)

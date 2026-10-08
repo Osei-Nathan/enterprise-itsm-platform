@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.test import TestCase
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
@@ -10,9 +12,16 @@ from .models import (
 	TicketCategory,
 	TicketEventType,
 	TicketPriority,
+	SlaPolicy,
 	TicketStatus,
 )
 from .serializers import TicketSerializer
+from .sla import (
+	calculate_sla_deadlines,
+	create_ticket,
+	evaluate_sla_breaches,
+	record_first_response,
+)
 
 
 class TicketModelTests(TestCase):
@@ -167,6 +176,128 @@ class TicketSerializerTests(TestCase):
 		self.assertEqual(ticket.department, self.department)
 
 
+class SlaServiceTests(TestCase):
+	def setUp(self):
+		self.department = Department.objects.create(name='Service Desk')
+		self.requester = User.objects.create_user(
+			username='sla-requester',
+			password='local-test-password',
+			role=UserRole.EMPLOYEE,
+			department=self.department,
+		)
+		self.technician = User.objects.create_user(
+			username='sla-technician',
+			password='local-test-password',
+			role=UserRole.TECHNICIAN,
+			department=self.department,
+		)
+
+	def make_ticket(self, priority=TicketPriority.MEDIUM):
+		return create_ticket({
+			'requester': self.requester,
+			'title': f'{priority} SLA test',
+			'description': 'SLA test ticket.',
+			'priority': priority,
+		})
+
+	def test_seeded_policy_targets_match_project_defaults(self):
+		expected = {
+			TicketPriority.CRITICAL: (timedelta(minutes=15), timedelta(hours=4)),
+			TicketPriority.HIGH: (timedelta(minutes=30), timedelta(hours=8)),
+			TicketPriority.MEDIUM: (timedelta(hours=2), timedelta(hours=24)),
+			TicketPriority.LOW: (timedelta(hours=4), timedelta(hours=72)),
+		}
+
+		for priority, targets in expected.items():
+			with self.subTest(priority=priority):
+				policy = SlaPolicy.objects.get(priority=priority, is_active=True)
+				self.assertEqual((policy.response_target, policy.resolution_target), targets)
+
+	def test_deadline_calculation_uses_elapsed_duration_targets(self):
+		policy = SlaPolicy.objects.get(priority=TicketPriority.CRITICAL)
+		started_at = timezone.now()
+
+		response_due_at, resolution_due_at = calculate_sla_deadlines(started_at, policy)
+
+		self.assertEqual(response_due_at, started_at + timedelta(minutes=15))
+		self.assertEqual(resolution_due_at, started_at + timedelta(hours=4))
+
+	def test_created_ticket_gets_priority_policy_and_deadlines(self):
+		ticket = self.make_ticket(TicketPriority.HIGH)
+
+		self.assertEqual(ticket.sla_policy.priority, TicketPriority.HIGH)
+		self.assertEqual(
+			ticket.first_response_due_at,
+			ticket.created_at + timedelta(minutes=30),
+		)
+		self.assertEqual(
+			ticket.resolution_due_at,
+			ticket.created_at + timedelta(hours=8),
+		)
+		self.assertFalse(ticket.response_breached)
+		self.assertFalse(ticket.resolution_breached)
+		self.assertTrue(ticket.events.filter(event_type=TicketEventType.TICKET_CREATED).exists())
+
+	def test_priority_change_recalculates_deadlines_from_original_creation(self):
+		ticket = self.make_ticket(TicketPriority.LOW)
+		priority_changed_at = ticket.created_at + timedelta(hours=1)
+		serializer = TicketSerializer(
+			ticket,
+			data={'priority': TicketPriority.CRITICAL},
+			partial=True,
+		)
+		self.assertTrue(serializer.is_valid(), serializer.errors)
+		ticket = serializer.save()
+
+		self.assertEqual(ticket.sla_policy.priority, TicketPriority.CRITICAL)
+		self.assertEqual(
+			ticket.first_response_due_at,
+			ticket.created_at + timedelta(minutes=15),
+		)
+		self.assertNotEqual(ticket.first_response_due_at, priority_changed_at)
+
+	def test_first_response_records_time_and_one_time_breach_event(self):
+		ticket = self.make_ticket(TicketPriority.CRITICAL)
+		responded_at = ticket.first_response_due_at + timedelta(seconds=1)
+
+		record_first_response(ticket, self.technician, responded_at=responded_at)
+		ticket.refresh_from_db()
+
+		self.assertEqual(ticket.first_responded_at, responded_at)
+		self.assertTrue(ticket.response_breached)
+		self.assertEqual(
+			ticket.events.filter(event_type=TicketEventType.FIRST_RESPONSE).count(),
+			1,
+		)
+		self.assertEqual(
+			ticket.events.filter(event_type=TicketEventType.SLA_BREACHED).count(),
+			1,
+		)
+		self.assertEqual(evaluate_sla_breaches(ticket, at=responded_at), [])
+
+	def test_resolution_breach_uses_existing_resolved_at_and_records_once(self):
+		ticket = self.make_ticket(TicketPriority.CRITICAL)
+		ticket.first_responded_at = ticket.first_response_due_at - timedelta(seconds=1)
+		ticket.resolved_at = ticket.resolution_due_at + timedelta(seconds=1)
+		ticket.status = TicketStatus.RESOLVED
+		ticket.save()
+
+		new_breaches = evaluate_sla_breaches(
+			ticket,
+			at=ticket.resolved_at,
+			actor=self.technician,
+		)
+		ticket.refresh_from_db()
+
+		self.assertEqual(new_breaches, ['Resolution'])
+		self.assertFalse(ticket.response_breached)
+		self.assertTrue(ticket.resolution_breached)
+		event = ticket.events.get(event_type=TicketEventType.SLA_BREACHED)
+		self.assertEqual(event.actor, self.technician)
+		self.assertEqual(event.details, 'Resolution target breached.')
+
+
+
 class TicketAPITests(APITestCase):
 	def setUp(self):
 		self.finance = Department.objects.create(name='Finance')
@@ -260,6 +391,9 @@ class TicketAPITests(APITestCase):
 				self.assertEqual(created.requester, user)
 				self.assertEqual(created.department, user.department)
 				self.assertEqual(created.priority, TicketPriority.HIGH)
+				self.assertEqual(created.sla_policy.priority, TicketPriority.HIGH)
+				self.assertIsNotNone(created.first_response_due_at)
+				self.assertIsNotNone(created.resolution_due_at)
 				self.assertEqual(created.status, TicketStatus.OPEN)
 				self.assertIsNone(created.assignee)
 
@@ -386,6 +520,7 @@ class TicketAPITests(APITestCase):
 			f'/api/tickets/{self.assigned_ticket.id}/',
 			{
 				'title': 'Updated by manager',
+				'priority': TicketPriority.HIGH,
 				'status': TicketStatus.CLOSED,
 				'assignee': self.other_technician.id,
 			},
@@ -395,6 +530,12 @@ class TicketAPITests(APITestCase):
 		self.assertEqual(response.status_code, 200, response.data)
 		self.assigned_ticket.refresh_from_db()
 		self.assertEqual(self.assigned_ticket.title, 'Updated by manager')
+		self.assertEqual(self.assigned_ticket.priority, TicketPriority.HIGH)
+		self.assertEqual(self.assigned_ticket.sla_policy.priority, TicketPriority.HIGH)
+		self.assertEqual(
+			self.assigned_ticket.resolution_due_at,
+			self.assigned_ticket.created_at + timedelta(hours=8),
+		)
 		self.assertEqual(self.assigned_ticket.status, TicketStatus.ASSIGNED)
 		self.assertEqual(self.assigned_ticket.assignee, self.technician)
 
@@ -502,6 +643,7 @@ class TicketAPITests(APITestCase):
 		self.assertEqual(ticket.resolution_summary, 'Replaced the faulty power adapter.')
 		self.assertIsNotNone(ticket.assigned_at)
 		self.assertIsNotNone(ticket.started_at)
+		self.assertIsNotNone(ticket.first_responded_at)
 		self.assertIsNotNone(ticket.pending_at)
 		self.assertIsNotNone(ticket.resolved_at)
 		self.assertIsNotNone(ticket.closed_at)
@@ -510,6 +652,7 @@ class TicketAPITests(APITestCase):
 			[
 				TicketEventType.ASSIGNED,
 				TicketEventType.STARTED,
+				TicketEventType.FIRST_RESPONSE,
 				TicketEventType.PENDED,
 				TicketEventType.RESUMED,
 				TicketEventType.RESOLVED,
