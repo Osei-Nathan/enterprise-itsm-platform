@@ -2,7 +2,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from .models import SlaPolicy, Ticket, TicketEvent, TicketEventType
+from .models import SlaMetric, SlaPolicy, Ticket, TicketEvent, TicketEventType
 
 
 def calculate_sla_deadlines(started_at, policy):
@@ -21,14 +21,28 @@ def _active_policy_for(priority):
 		}) from error
 
 
-def _record_breach(ticket, actor, metric):
-	TicketEvent.objects.create(
+def _record_sla_event(ticket, actor, metric, event_type, details):
+	_, created = TicketEvent.objects.get_or_create(
 		ticket=ticket,
-		actor=actor,
-		event_type=TicketEventType.SLA_BREACHED,
-		from_status=ticket.status,
-		to_status=ticket.status,
-		details=f'{metric} target breached.',
+		event_type=event_type,
+		sla_metric=metric,
+		defaults={
+			'actor': actor,
+			'from_status': ticket.status,
+			'to_status': ticket.status,
+			'details': details,
+		},
+	)
+	return created
+
+
+def _record_breach(ticket, actor, metric):
+	return _record_sla_event(
+		ticket,
+		actor,
+		metric,
+		TicketEventType.SLA_BREACHED,
+		f'{metric.label} target breached.',
 	)
 
 
@@ -43,14 +57,14 @@ def evaluate_sla_breaches(ticket, at=None, actor=None):
 		if response_time > ticket.first_response_due_at:
 			ticket.response_breached = True
 			updates.append('response_breached')
-			new_breaches.append('First response')
+			new_breaches.append(SlaMetric.FIRST_RESPONSE)
 
 	if ticket.resolution_due_at and not ticket.resolution_breached:
 		resolution_time = ticket.resolved_at or at
 		if resolution_time > ticket.resolution_due_at:
 			ticket.resolution_breached = True
 			updates.append('resolution_breached')
-			new_breaches.append('Resolution')
+			new_breaches.append(SlaMetric.RESOLUTION)
 
 	if updates:
 		ticket.save(update_fields=(*updates, 'updated_at'))

@@ -57,6 +57,18 @@ REST_FRAMEWORK = {
     ],
 }
 
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://127.0.0.1:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://127.0.0.1:6379/1')
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_BEAT_SCHEDULE = {
+    'check-sla-breaches-every-minute': {
+        'task': 'tickets.tasks.check_sla_breaches',
+        'schedule': 60.0,
+    },
+}
+SLA_WARNING_WINDOW_MINUTES = int(os.getenv('SLA_WARNING_WINDOW_MINUTES', '15'))
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',

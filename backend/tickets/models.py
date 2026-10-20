@@ -49,6 +49,11 @@ class TicketEventType(models.TextChoices):
 	REOPENED = 'REOPENED', 'Reopened'
 
 
+class SlaMetric(models.TextChoices):
+	FIRST_RESPONSE = 'FIRST_RESPONSE', 'First Response'
+	RESOLUTION = 'RESOLUTION', 'Resolution'
+
+
 class SlaPolicy(models.Model):
 	priority = models.CharField(
 		max_length=20,
@@ -161,6 +166,11 @@ class TicketEvent(models.Model):
 		blank=True,
 	)
 	event_type = models.CharField(max_length=20, choices=TicketEventType.choices)
+	sla_metric = models.CharField(
+		max_length=20,
+		choices=SlaMetric.choices,
+		blank=True,
+	)
 	from_status = models.CharField(
 		max_length=20,
 		choices=TicketStatus.choices,
@@ -176,6 +186,15 @@ class TicketEvent(models.Model):
 
 	class Meta:
 		ordering = ('created_at', 'id')
+		constraints = (
+			models.UniqueConstraint(
+				fields=('ticket', 'event_type', 'sla_metric'),
+				condition=models.Q(
+					event_type__in=(TicketEventType.SLA_WARNING, TicketEventType.SLA_BREACHED)
+				),
+				name='unique_ticket_sla_event_metric',
+			),
+		)
 
 	def __str__(self):
 		return f'{self.ticket.ticket_number}: {self.get_event_type_display()}'

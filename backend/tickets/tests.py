@@ -4,6 +4,7 @@ from django.test import TestCase
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 from rest_framework.test import APIRequestFactory, APITestCase
+from .tasks import check_sla_breaches
 
 from accounts.models import Department, User, UserRole
 
@@ -12,6 +13,7 @@ from .models import (
 	TicketCategory,
 	TicketEventType,
 	TicketPriority,
+	SlaMetric,
 	SlaPolicy,
 	TicketStatus,
 )
@@ -289,12 +291,231 @@ class SlaServiceTests(TestCase):
 		)
 		ticket.refresh_from_db()
 
-		self.assertEqual(new_breaches, ['Resolution'])
+		self.assertEqual(new_breaches, [SlaMetric.RESOLUTION])
 		self.assertFalse(ticket.response_breached)
 		self.assertTrue(ticket.resolution_breached)
 		event = ticket.events.get(event_type=TicketEventType.SLA_BREACHED)
 		self.assertEqual(event.actor, self.technician)
 		self.assertEqual(event.details, 'Resolution target breached.')
+
+
+
+class SlaTaskTests(TestCase):
+	def setUp(self):
+		self.department = Department.objects.create(name='SLA Task Department')
+		self.requester = User.objects.create_user(
+			username='sla-task-requester',
+			password='local-test-password',
+			role=UserRole.EMPLOYEE,
+			department=self.department,
+		)
+
+	def make_ticket(self, priority=TicketPriority.CRITICAL):
+		return create_ticket({
+			'requester': self.requester,
+			'title': f'{priority} task test',
+			'description': 'Celery SLA task test ticket.',
+			'priority': priority,
+		})
+
+	def set_sla_times(
+		self,
+		ticket,
+		response_due_at,
+		resolution_due_at,
+		first_responded_at=None,
+		resolved_at=None,
+	):
+		ticket.first_response_due_at = response_due_at
+		ticket.resolution_due_at = resolution_due_at
+		ticket.first_responded_at = first_responded_at
+		ticket.resolved_at = resolved_at
+		ticket.save(update_fields=[
+			'first_response_due_at',
+			'resolution_due_at',
+			'first_responded_at',
+			'resolved_at',
+		])
+
+	def test_first_response_warning_is_created(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=now + timedelta(minutes=5),
+			resolution_due_at=now + timedelta(hours=1),
+		)
+
+		result = check_sla_breaches()
+
+		self.assertEqual(result['warnings_created'], 1)
+		self.assertEqual(result['breaches_created'], 0)
+		self.assertTrue(ticket.events.filter(
+			event_type=TicketEventType.SLA_WARNING,
+			sla_metric=SlaMetric.FIRST_RESPONSE,
+		).exists())
+
+		ticket.refresh_from_db()
+		self.assertFalse(ticket.response_breached)
+
+	def test_resolution_warning_is_created(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=now + timedelta(hours=1),
+			resolution_due_at=now + timedelta(minutes=5),
+		)
+
+		result = check_sla_breaches()
+
+		self.assertEqual(result['warnings_created'], 1)
+		self.assertEqual(result['breaches_created'], 0)
+		self.assertTrue(ticket.events.filter(
+			event_type=TicketEventType.SLA_WARNING,
+			sla_metric=SlaMetric.RESOLUTION,
+		).exists())
+
+		ticket.refresh_from_db()
+		self.assertFalse(ticket.resolution_breached)
+
+	def test_first_response_breach_is_created_and_flag_is_set(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=now - timedelta(minutes=2),
+			resolution_due_at=now + timedelta(hours=1),
+		)
+
+		result = check_sla_breaches()
+
+		ticket.refresh_from_db()
+		self.assertTrue(ticket.response_breached)
+		self.assertFalse(ticket.resolution_breached)
+		self.assertEqual(result['breaches_created'], 1)
+		self.assertTrue(ticket.events.filter(
+			event_type=TicketEventType.SLA_BREACHED,
+			sla_metric=SlaMetric.FIRST_RESPONSE,
+		).exists())
+
+	def test_resolution_breach_is_created_and_flag_is_set(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=now + timedelta(hours=1),
+			resolution_due_at=now - timedelta(minutes=2),
+		)
+
+		result = check_sla_breaches()
+
+		ticket.refresh_from_db()
+		self.assertFalse(ticket.response_breached)
+		self.assertTrue(ticket.resolution_breached)
+		self.assertEqual(result['breaches_created'], 1)
+		self.assertTrue(ticket.events.filter(
+			event_type=TicketEventType.SLA_BREACHED,
+			sla_metric=SlaMetric.RESOLUTION,
+		).exists())
+
+	def test_repeated_task_runs_do_not_duplicate_warning_events(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=now + timedelta(minutes=5),
+			resolution_due_at=now + timedelta(hours=1),
+		)
+
+		first_result = check_sla_breaches()
+		second_result = check_sla_breaches()
+
+		self.assertEqual(first_result['warnings_created'], 1)
+		self.assertEqual(second_result['warnings_created'], 0)
+		self.assertEqual(
+			ticket.events.filter(
+				event_type=TicketEventType.SLA_WARNING,
+				sla_metric=SlaMetric.FIRST_RESPONSE,
+			).count(),
+			1,
+		)
+
+	def test_repeated_task_runs_do_not_duplicate_breach_events(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=now - timedelta(minutes=2),
+			resolution_due_at=now + timedelta(hours=1),
+		)
+
+		first_result = check_sla_breaches()
+		second_result = check_sla_breaches()
+
+		self.assertEqual(first_result['breaches_created'], 1)
+		self.assertEqual(second_result['breaches_created'], 0)
+		self.assertEqual(
+			ticket.events.filter(
+				event_type=TicketEventType.SLA_BREACHED,
+				sla_metric=SlaMetric.FIRST_RESPONSE,
+			).count(),
+			1,
+		)
+
+	def test_ticket_completed_within_sla_is_ignored(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+		response_due = now - timedelta(minutes=10)
+		resolution_due = now - timedelta(minutes=5)
+
+		self.set_sla_times(
+			ticket,
+			response_due_at=response_due,
+			resolution_due_at=resolution_due,
+			first_responded_at=response_due - timedelta(minutes=1),
+			resolved_at=resolution_due - timedelta(minutes=1),
+		)
+
+		result = check_sla_breaches()
+
+		ticket.refresh_from_db()
+		self.assertFalse(ticket.response_breached)
+		self.assertFalse(ticket.resolution_breached)
+		self.assertEqual(result['tickets_checked'], 0)
+		self.assertEqual(result['warnings_created'], 0)
+		self.assertEqual(result['breaches_created'], 0)
+		self.assertFalse(ticket.events.filter(
+			event_type__in=[
+				TicketEventType.SLA_WARNING,
+				TicketEventType.SLA_BREACHED,
+			],
+		).exists())
+
+	def test_task_returns_accurate_counters(self):
+		ticket = self.make_ticket()
+		now = timezone.now()
+
+		# One metric is approaching its deadline; the other has breached.
+		self.set_sla_times(
+			ticket,
+			response_due_at=now + timedelta(minutes=5),
+			resolution_due_at=now - timedelta(minutes=2),
+		)
+
+		result = check_sla_breaches()
+
+		self.assertEqual(result, {
+			'tickets_checked': 1,
+			'warnings_created': 1,
+			'breaches_created': 1,
+		})
 
 
 
